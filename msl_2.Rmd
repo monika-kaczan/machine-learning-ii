@@ -1,0 +1,801 @@
+---
+title: 'MSL 2 regression analysis: Beijing housing prices'
+author: "Monika Kaczan, Michał Sękowski"
+date: "03/03/2023"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+<style>
+body {
+text-align: justify}
+</style>
+
+## Introduction
+
+As our population grows and more people move to cities, we will observe growing and probably unsatisfied demand for housing. This is why it is important to study housing and its prices in different parts of the world.  
+
+In this project our goal is to predict house prices in Beijing based on their characteristics. Our dataset was webscrapped from Lianjia.com website. Firstly, we transformed the data and did explanatory data analysis. Next, we modeled (logarithm of) price of a square meter of a house taking into account things like its area, rooms, location and building it belongs to. We used OLS regression, random forest, XGBoost and neural networks. Finally, we compared results obtained from all the methods. 
+
+## Data preprocessing & EDA
+
+The dataset we used comes from Kaggle <https://www.kaggle.com/datasets/ruiqurm/lianjia>. It included houses and their characteristics webscrapped from the website of chinese real-estate brokerage company Lianjia. We transformed the dataset in such a way that it resembles the real-world modelling situation as best as possible.
+
+
+### Loading & transforming the data
+
+```{r pressure, include=FALSE}
+
+setwd("~/project_MSL_Kaczan_Sekowski_RMD")
+
+# Loading necessary libraries.
+
+library(dplyr)
+library(ggplot2)
+library(corrplot)
+library(tidyverse)
+library(caret)
+```
+
+```{r}
+original_data <- read.csv("data.csv")
+summary(original_data)
+```
+
+We already see that we do not need all the columns from the dataset. Also, DOM column contain around 50% of NAs, so we can drop it as well. We transform selected columns to the numerical type. At this stage we also rename categorical variables for easier interpretation later.
+
+```{r echo=TRUE}
+data <- original_data[, -c(1, 2, 5, 7, 26)] 
+data <- data %>% 
+  rename('bathroom' = 'bathRoom', 'aream2' = 'square', 'pricem2' = 'price', 'price' = 'totalPrice',
+                        'bedroom' = 'livingRoom', 'livingroom' = 'drawingRoom') %>%
+  mutate(buildingType = case_when(buildingType == 1 ~ "Tower",
+                                buildingType == 2 ~ "Bungalow",
+                                buildingType == 3 ~ "Plate/Tower",
+                                buildingType == 4 ~ "Plate"))%>% 
+  mutate(buildingStructure = case_when(buildingStructure == 1 ~ "Unavailable",
+                                       buildingStructure == 2 ~ "Mixed",
+                                       buildingStructure == 3 ~ "Brick/Wood",
+                                       buildingStructure == 4 ~ "Brick/Concrete",
+                                       buildingStructure == 5 ~ "Steel",
+                                       buildingStructure == 6 ~ "Steel/Concrete")) %>% 
+  mutate(renovationCondition = case_when(renovationCondition == 1 ~ "Other",
+                                         renovationCondition == 2 ~ "Rough",
+                                         renovationCondition == 3 ~ "Simplicity",
+                                         renovationCondition == 4 ~ "Hardcover")) %>%
+  mutate(district = case_when(district == 1 ~ "DongCheng",
+                              district == 2 ~ "FengTai",
+                              district == 3 ~ "DaXing",
+                              district == 4 ~ "FaXing",
+                              district == 5 ~ "FangShang",
+                              district == 6 ~ "ChangPing",
+                              district == 7 ~ "ChaoYang",
+                              district == 8 ~ "HaiDian",
+                              district == 9 ~ "ShiJingShan",
+                              district == 10 ~ "XiCheng",
+                              district == 11 ~ "TongZhou",
+                              district == 12 ~ "ShunYi",
+                              district == 13 ~ "MenTouGou")) %>%
+  mutate(tradeTime = as.Date(data$tradeTime))  %>%
+  mutate(buildingAge = 2017 - as.numeric(constructionTime))
+
+data <- data[, !names(data) %in% c("constructionTime")]
+data$bedroom = as.numeric(data$bedroom)
+data$livingroom = as.numeric(data$livingroom)
+data$bathroom = as.numeric(data$bathroom)
+data$floor = as.numeric(gsub(".*\\ ", "", data$floor))
+```
+
+We have around 6,5% of observations with one or more variables missing. It is mainly due to a large number of observations without buildingAge. Later we will learn that buildingAge has quite significant correlation with the target variable. Filling it out with e.g. mean could lead to wrong conclusions. So for the simplicity and because of already having a large dataset we decided to delete all observations with at least one missing value. 
+
+```{r}
+summary(data)
+sum(!complete.cases(data))
+data <- na.omit(data)
+```
+
+We dropped observations in which we suspected errors in the depended variable. They might have occurred due to the webscrapping process or this observation not being an apartment. We detect errors based on price, pricem2 and aream2 variables as they are directly connected.
+
+```{r}
+hist(data$pricem2)
+# We see that there are few observations with pricem2 lower than 10000 RMB (around 1500 USD)
+
+data <- data[data$pricem2 > 10000, ]
+data <- data[(data$aream2 < 500 & data$aream2 > 10), ]
+```
+
+House prices in China change quite drastically over time. Market conditions follow randoms patterns (houses are also a common form of investing in China) therefore it is hard to compare different periods with each other. We decided to limit our analysis to the most recent year of 2017.
+
+```{r}
+hist(data$tradeTime, breaks = "months")
+data <- data[(data$tradeTime > '2011-12-31' & data$tradeTime < '2018-01-01'), ]
+
+# Price per m2 changes over time. 
+data$month <- months(data$tradeTime)
+data$year <- format(data$tradeTime, format="%y")
+pom1 <- aggregate(price ~ month + year , data , mean)
+pom2 <- aggregate(pricem2 ~ month + year , data , mean)
+
+pom1$date <- as.Date(paste('01', pom1$month, pom1$year), format='%d %B %y')
+pom2$date <- as.Date(paste('01', pom2$month, pom2$year), format='%d %B %y')
+
+plot(pom2$date, pom2$pricem2)
+
+# Limit the dataset to 2017.
+df <- data[(data$tradeTime > '2016-12-31' & data$tradeTime < '2018-01-01'), ]
+```
+
+
+### Variables selection
+
+After loading and transforming the data we focused on selecting appropriate variables for our model.
+
+
+##### Target variable
+
+We we decided to choose logarithm of square meter price instead of square meter price (in RMB) as our target variable. This is due to its smaller relative variance and closer to normal distribution. However, we keep in mind that to present the result later for the economic interpretation, we will need to perform reverse operation to taking logarithm on square meter price. 
+
+```{r}
+
+print("Relative variance of pricem2: ", sd(df$pricem2) / mean(df$pricem2) )
+hist(df$pricem2)
+print("Relative variance of lnpricem2: ", sd(log(df$pricem2)) / mean(log(df$pricem2)) )
+hist(log(df$pricem2))
+
+df$lnpricem2 <- log(df$pricem2)
+
+```
+
+
+##### Continuous variables
+
+For continuous variables, we checked their correlations with the target variable. 
+
+```{r}
+df <- df %>% relocate(price, pricem2, lnpricem2)
+
+df$rooms <- df$bedroom + df$bathroom # We added additional variable with total number of rooms.
+
+df_corr <- df[, -c(6, 11, 14, 15, 16, 18, 19, 20, 21, 23, 24)]
+corrplot(cor(na.omit(df_corr)))
+```
+
+Based on the plot we can drop the following variables:
+
+* Latitude and Longitude - they have very low correlation with target variable and are redundant because of the categorical district variable
+* ladderRatio (ratio of the number of elevators to apartments on the floor) - also has very low correlation with target variable and not significant in real-world
+* bedroom and livingroom - they are redundant to the rooms variable which is more general
+
+
+##### Categorical variables
+
+For categorical variables, we checked whether differences in means of target variable between these groups are significant based on boxplots and ANOVA tests.
+
+Kitchen and subway 
+
+```{r}
+summary(aov(lnpricem2 ~ kitchen, data = df))
+summary(aov(lnpricem2 ~ subway, data = df))
+
+# Groups based on having kitchen / closeness to subway have different means of target variable. Therefore it is worthy to keep them. 
+```
+
+Renovation condition
+
+```{r}
+table(df$renovationCondition)
+boxplot(df$lnpricem2 ~ df$renovationCondition)
+# Only Rough has visibly different mean.
+
+simplicity <- df[df$renovationCondition == 'Simplicity', ]$lnpricem2
+other <- df[df$renovationCondition == 'Other', ]$lnpricem2
+t.test(simplicity, other)
+# The difference in means in Simplicity and Other is not significant and we decided to merge those two groups. For other group combination p-value of t.test was close to 0.1 to we kept it separate.
+
+df$renovationCondition[df$renovationCondition == 'Other'] <- 'Simplicity/Other'
+df$renovationCondition[df$renovationCondition == 'Simplicity'] <- 'Simplicity/Other'
+table(df$renovationCondition)
+```
+
+Building type
+
+```{r}
+table(df$buildingType)
+df <- df[!(df$buildingType == "Bungalow"), ] # Bungalow is only 1 row so we delete this observation
+
+boxplot(df$lnpricem2 ~ df$buildingType)
+summary(aov(lnpricem2 ~ buildingType, data = df))
+# Groups have statistically different means
+```
+
+Building structure
+
+```{r}
+table(df$buildingStructure)
+boxplot(df$lnpricem2 ~ df$buildingStructure)
+
+# We dropped Brick/Wood and Unavailable categories and mergerd Steel and Steel/Concrete category.
+df <- df[!(df$buildingStructure =="Unavailable" | df$buildingStructure =="Brick/Wood"), ]
+df$buildingStructure[df$buildingStructure == 'Steel'] <- 'Steel/Concrete'
+
+summary(aov(lnpricem2 ~ buildingStructure, data = df))
+```
+
+District
+
+```{r}
+boxplot(df$lnpricem2 ~ df$district)
+# At first sight we see that the means of target variable and it distribution is different for different districts. The differences are quite significant and it  was hard to make groups based on location so we kept all of them.
+```
+
+Month
+
+```{r}
+boxplot(df$lnpricem2 ~ df$month)
+# Here to reduce number of variables we can split the data based on quarters instead of months.
+df$quarter <- 'Q4'
+df$quarter[df$month == 'January' | df$month == 'February' | df$month == 'March' ] <- 'Q1'
+df$quarter[df$month == 'April' | df$month == 'May' | df$month == 'June' ] <- 'Q2'
+df$quarter[df$month == 'July' | df$month == 'August' | df$month == 'September' ] <- 'Q3'
+table(df$quarter)
+table(df$month)
+```
+
+
+### Preparing data for modelling
+
+Lastly, we prepare our data directly for the modelling process. We sort out the columns and encode categorical variables into dummies.
+
+```{r}
+df_categorical <- df[, c("lnpricem2", "pricem2", "aream2", "rooms", "kitchen", "bathroom", "floor", "renovationCondition", "buildingType",
+             "buildingStructure", "buildingAge", "elevator", "subway", "district", "fiveYearsProperty", "quarter")]
+
+dmy <- dummyVars(" ~ .", data = df_categorical, fullRank=T)
+df_encoded <- data.frame(predict(dmy, newdata = df_categorical))
+summary(df_encoded)
+
+# We can save the data to separate file.
+save(df_encoded, file = "data_encoded.RData")
+```
+
+We also split the data into testing and training samples. Evaluating results from particular models will be done mostly through cross-validation on training data.
+
+```{r}
+
+set.seed(410998)
+
+train_observations <- createDataPartition(df_encoded$lnpricem2, 
+                             p = 0.7, 
+                             list = FALSE) 
+
+houses_train <- df_encoded[train_observations,]
+houses_test <- df_encoded[-train_observations,]
+
+model_formula <- lnpricem2 ~ aream2 + rooms + kitchen + bathroom + floor + renovationConditionRough + renovationConditionSimplicity.Other +
+  buildingTypePlate.Tower + buildingTypeTower + buildingStructureMixed + buildingAge + elevator + subway + fiveYearsProperty +
+  districtChaoYang + districtDaXing + districtDongCheng + districtFangShang + districtFaXing + districtFengTai +
+  districtHaiDian + districtMenTouGou + districtShiJingShan + districtShunYi + districtTongZhou + districtXiCheng +
+  quarterQ2 + quarterQ3 + quarterQ4
+
+```
+
+We also define additional function to calculate regression metrics.
+
+```{r}
+regressionMetrics <- function(real, predicted, name) {
+  
+  method <- name
+  
+  # Mean Square Error
+  MSE <- mean((real - predicted)^2)
+  
+  # Root Mean Square Error
+  RMSE <- sqrt(MSE)
+  
+  # Mean Absolute Error
+  MAE <- mean(abs(real - predicted))
+  
+  # Mean Absolute Percentage Error
+  MAPE <- mean(abs(real - predicted)/real)
+  
+  # Median Absolute Error
+  MedAE <- median(abs(real - predicted))
+  
+  # R2
+  #R2 <- cor(predicted, real)^2
+  
+  result <- data.frame(name, MSE, RMSE, MAE, MAPE) #, R2)
+  return(result)
+  
+}
+```
+
+
+## Modelling
+
+To predict the logarithm of price per square meter of a house, we will use several methods. This will be: OLS regression, random forests, XGBoost and neural networks. Please note that it took over several hours to calculate some of the models presented below, so for convenience they are loaded from files prepared earlier.  
+
+
+### OLS regression
+
+As a benchmark for our models we took ordinary least square regression.
+
+```{r}
+set.seed(410998)
+
+# We use 5-fold cross-validation to estimate prediction error. 
+ctrl_cv5 <- trainControl(method = "cv", number = 5)
+
+houses_ols <- train(model_formula, data = houses_train, method = "lm", trControl = ctrl_cv5)
+
+summary(houses_ols)
+```
+
+We see that all variables in the dataset are significant (or jointly significant, as in case of district). It is reasonable, as in the preproccesing phase we already dropped variables based on literature, common sense and the (lack of) linear relationships with the target variable. 
+
+We can check the regression metrics.
+
+```{r}
+print(houses_ols)
+mean(houses_ols$resample$RMSE)/mean(houses_train$lnpricem2)
+
+results_train_ols <- regressionMetrics(real = houses_train$lnpricem2,
+                                  predicted = predict(houses_ols, newdata = houses_train),
+                                  name = "OLS")
+results_train_ols
+```
+
+In terms of relative RMSE which is just around 2% the results seem very good. However, to assess the real performance we should compare it to other methods.
+
+
+### Random forests
+
+Firstly we tried random forest. Random forest combines output of multiple decision trees to get a single result. We build models using bootstrap subsamples of the training set. In a single tree, for each split we consider a random sample of m predictors from the full set of p predictors. For the next split, we again consider a new random subsample of m predictors.
+
+We started with a random forest model from randomForest package with default parameters to explore how error changes depending on tree size.
+
+```{r}
+set.seed(410998)
+
+# houses_rf1 <- randomForest(model_formula, 
+#                           data = houses_train)
+# saveRDS(houses_rf1, 'houses_rf1.rds')
+
+houses_rf1 <- readRDS('houses_rf1.rds')
+# print(houses_rf1)
+# plot(houses_rf1)
+```
+
+We see that the error stays pretty constant after around 200 trees so we will limit number of trees to that. Now we can try to optimize the number of parameters to consider in each split. 
+
+We use out-of-bag error as a prediction error measure because it requires less computation than cross-validation. It is due to the fact that bagging used in random forests uses subsampling with replacement to create training samples for the model to learn from.
+
+```{r}
+set.seed(410998)
+
+ctrl_oob2 <- trainControl(method = "oob")
+
+parameters_rf2 <- expand.grid(mtry = c(5, 10, 15, 20, 25))
+
+# houses_rf2 <- train(model_formula,
+#                     data = houses_train,
+#                     method = "rf",
+#                     ntree = 200,
+#                     tuneGrid = parameters_rf2,
+#                     trControl = ctrl_oob2,
+#                     importance = TRUE)
+# saveRDS(houses_rf2, 'houses_rf2.rds')
+houses_rf2 <- readRDS('houses_rf2.rds')
+print(houses_rf2)
+plot(houses_rf2)
+```
+
+We see that it is enough to set 15 as the number of parameters to consider in each split. We also tried to optimize nodesize, which was previously left as default 5, but it turned out that 5 is in fact the best option out of 5, 10 and 50. 
+
+```{r}
+results_train_rf2 <- regressionMetrics(real = houses_train$lnpricem2,
+                                  predicted = predict(houses_rf2, newdata = houses_train),
+                                  name = "Random forest")
+results_train_rf2
+```
+
+Thanks to random forests we were able to significantly improve results compared to OLS. The RMSE error is over 2 times lower!
+
+We also tried random forest method implemented in the ranger package with the (default) 500 trees.
+
+```{r}
+set.seed(410998)
+
+# We use 5-fold cross-validation to estimate prediction error. 
+ctrl_cv5 <- trainControl(method = "cv", number = 5)
+
+# We also tried random forest method implemented in the ranger package with the (default) 500 trees.
+
+parameters_ranger <- expand.grid(mtry = c(5, 10, 15, 20, 25),
+                                 splitrule = "variance",
+                                 min.node.size = c(5, 10, 50, 100, 200))
+
+set.seed(410998)
+# houses_rf4 <- train(model_formula, 
+#                     data = houses_train, 
+#                     method = "ranger", 
+#                     num.trees = 500, 
+#                     tuneGrid = parameters_ranger, 
+#                     trControl = ctrl_cv5)
+# saveRDS(houses_rf4, "houses_rf4.rds")
+houses_rf4 <- readRDS('houses_rf4.rds')
+plot(houses_rf4)
+print(houses_rf4)
+```
+
+We obtained the best results for 15 randomly selected predictors (mtry) and minimal node size of 5.
+
+```{r}
+results_train_rf4 <- regressionMetrics(real = houses_train$lnpricem2,
+                                  predicted = predict(houses_rf4, newdata = houses_train),
+                                  name = "Random forest (ranger)")
+results_train_rf4
+```
+
+For random forests implemented by ranger package, the error metrics are almost equal but slightly better. We can take it then as our final model for random forests.
+
+
+### XGBoost
+
+Next we tried XGBoost. XGBoost is a type of gradient boosting i.e. a procedure, where final prediction is created by combining results of many decision trees with are dependent on the previous ones. In opposite to random forest, these trees have low depth and influence final prediction in different extend. XGBoost is equipped with additional features such as intelligent tree pruning and Newton-Raphson approximation which make it generally more efficient than standard gradient boosting.
+
+First let's try XGBoost with default parameters.
+
+```{r}
+set.seed(410998)
+
+# We use 5-fold cross-validation to estimate prediction error. 
+ctrl_cv5 <- trainControl(method = "cv", number = 5)
+
+# houses_xgb1 <- train(model_formula,
+#                     data = houses_train,
+#                     method = "xgbTree",
+#                     trControl = ctrl_cv5)
+# saveRDS(houses_xgb1, 'houses_xgb1.rds')
+
+houses_xgb1 <- readRDS('houses_xgb1.rds')
+plot(houses_xgb1)
+```
+
+We see that generally:
+
+- increasing number of rounds lowers prediction errors. We can try to increase it further and set nrounds = c(150, 200, 250).
+- max_depth was low in this example, only ranging from 1 to 3 and 3 gave the best results. We can try max_depth = c(3, 5, 10, 15, 20).
+- subsample had a little effect on performance, but generally the best results were for 0.5 or 0.75
+- colsample by tree also seems to not have any significant effect, so we sticked with 0.8
+We can also try to optimize the min_child_weight parameter. We went with options up to 1% of observations.
+
+Let's try to tune in those parameters.
+
+```{r}
+# We use 5-fold cross-validation to estimate prediction error. 
+ctrl_cv5 <- trainControl(method = "cv", number = 5)
+
+# Now let's try different values of some parameters
+parameters_xgb2 <- expand.grid(nrounds = c(150, 200, 250),
+                               max_depth = c(3, 5, 10, 15, 20),
+                               eta = c(0.4),
+                               gamma = 0,
+                               colsample_bytree = 0.8,
+                               min_child_weight = c(1, 50, 100, 200, 400),
+                               subsample = c(0.5, 0.75))
+
+# houses_xgb2 <- train(model_formula,
+#                      data = houses_train,
+#                      method = "xgbTree",
+#                      trControl = ctrl_cv5,
+#                      tuneGrid  = parameters_xgb2)
+# saveRDS(houses_xgb2, "houses_xgb2.rds")
+
+houses_xgb2 <- readRDS('houses_xgb2.rds')
+plot(houses_xgb2)
+```
+
+By loooking a those plot we can say that:
+
+- for subsample 0.75 is better than 0.5
+- min_child_weight of 1 gives unstable results regarding max_tree depth, here optimal value would be 100
+ - optimal max_tree_depth would be 10 - this is where RMSE dropped for almost all combinations of parameters
+- nrounds seems to not have significant effect of performance - let's choose 200
+
+Let's implement those conclusions and optimize the rest of parameters:
+
+- eta (learning rate)
+- gamma (minimum loss reduction)
+- colsample_bytree
+
+```{r}
+set.seed(410998)
+
+# We use 5-fold cross-validation to estimate prediction error. 
+ctrl_cv5 <- trainControl(method = "cv", number = 5)
+
+parameters_xgb3 <- expand.grid(nrounds = c(200),
+                               max_depth = c(10),
+                               eta = c(0.1, 0.2, 0.4, 0.6),
+                               gamma = c(0, 1, 2, 5),
+                               colsample_bytree = c(0.5, 0.8, 1), 
+                               min_child_weight = c(100),
+                               subsample = c(0.75))
+
+# houses_xgb3 <- train(model_formula,
+#                      data = houses_train,
+#                      method = "xgbTree",
+#                      trControl = ctrl_cv5,
+#                      tuneGrid  = parameters_xgb3)
+# saveRDS(houses_xgb3, "houses_xgb3.rds")
+
+houses_xgb3 <- readRDS('houses_xgb3.rds')
+plot(houses_xgb3)
+```
+
+We see that:
+
+- the higher gamma the worse results. The best are obtained for gamma = 0
+- the optimal shrinkage for gamma = 0 is always 0.2
+- colsmaple by tree has no significant effect on results. For these models 0.8 is the best by a small margin
+
+The final model of XGBoost parameter tuning had the following RMSE on cross-validation and parameters:
+
+```{r}
+print(houses_xgb3$finalModel)
+print(min(houses_xgb3$resample$RMSE))
+houses_xgb3$finalModel
+```
+
+```{r}
+results_train_xgb3 <- regressionMetrics(real = houses_train$lnpricem2,
+                                  predicted = predict(houses_xgb3, newdata = houses_train),
+                                  name = "XGBoost")
+results_train_xgb3
+```
+
+Surprisingly, we performed much worse compared to random forests. However, we still significantly improved results compared to OLS.
+
+There could be other, better sets of parameters we didn't took into account in the proccess of tuning the model. Previously we used gridSearch to search for optimal parameters in their pre-defined combinations. However, we can use random search for optimal parameters. Although it may be inefficient to use random search for XGBoost due to its complicated grid, we believe this can be an interesting exercise as well to compare the results from both methods.
+
+```{r}
+set.seed(410998)
+
+# We use 5-fold cross-validation to estimate prediction error and we specify the random search with 100 unique combinations
+# of parameters.
+ctrl_cv5 <- trainControl(method = "cv", number = 5, search = "random")
+n_combinations = 100
+
+# houses_xgb_randomSearch <- train(model_formula,
+#                      data = houses_train,
+#                      method = "xgbTree",
+#                      trControl = ctrl_cv5,
+#                      tuneLength = n_combinations)
+# saveRDS(houses_xgb_randomSearch, "houses_xgb_randomSearch.rds")
+
+houses_xgb_randomSearch <- readRDS('houses_xgb_randomSearch.rds')
+# print(houses_xgb_randomSearch)
+min(houses_xgb_randomSearch$results["RMSE"])
+
+```
+
+Random search tried lots of, often quite unlikely, values of parameters. However, as expected it did not provide better results than manual tuning due to a large number of parameters to optimize.
+
+
+### Neural networks
+
+The last algorithm we tried was Neural Networks. Neural Networks are aimed to discover information hidden in linear combinations of input data, and then to use them in modelling non-linear relationships between predictors and the target variable. It is performed in the system, where input signals are connected with output signals with a network of links built of neurons (nodes), layers, activation functions and weights.
+
+
+Before all, we standarize all continous variables to allow for more efficient training of neural network activation functions.
+
+```{r echo=TRUE}
+
+(houses_maxs <- apply(houses_train, 2, max))
+(houses_mins <- apply(houses_train, 2, min))
+
+c = houses_mins
+s = houses_maxs - houses_mins
+
+houses_train_scaled <-
+  as.data.frame(scale(houses_train, center = c, scale  = s))
+houses_test_scaled <-
+  as.data.frame(scale(houses_test, center = c, scale  = s))
+
+# We will also keep parameter values to destandarize separately the target variable so that we can compare regression metrics we obtained with the ones from other models.
+
+houses_maxs_lnpricem2 <- max(houses_train$lnpricem2)
+houses_mins_lnpricem2 <- min(houses_train$lnpricem2)
+
+c_lnpricem2 = houses_mins_lnpricem2
+s_lnpricem2 = houses_maxs_lnpricem2 - houses_mins_lnpricem2
+```
+
+#### Fast-forward neural network
+
+Let's move to modelling. Firstly we will test some simple models with default parameters: just a few neurons (1, 3 or 5) in one hidden layer and a low decay (0, 0.0001 or 0.1). Please note that we will use train with the "nnet" method which is a feed-forward neural networks with a single hidden layer.
+
+```{r}
+set.seed(410098)
+
+# We use 5-fold cross-validation to estimate prediction error. 
+ctrl_cv5 <- trainControl(method = "cv", number = 5)
+
+# houses_nn1  <- train(model_formula,
+#                      data = houses_train_scaled,
+#                      method = "nnet",
+#                      trControl = ctrl_cv5,
+#                      linear.output = T)
+# saveRDS(houses_nn1, "houses_nn1.rds") 
+
+houses_nn1 <- readRDS('houses_nn1.rds')
+print(houses_nn1)
+```
+
+Let's compare the results to previous models. To do that, we need to unscale the predicted results and only then calculate regression metrics.
+
+```{r}
+predicted1 = predict(houses_nn1, newdata = houses_train_scaled)
+predicted1_unscaled <- t((t(predicted1) * s_lnpricem2) + c_lnpricem2)
+
+regressionMetrics(houses_train$lnpricem2, predicted1_unscaled, "Neural network [for tuning]")
+```
+
+The results of the best model chosen by cross-validation are better than OLS, but worse than previous methods of Random Forests (by a lot) or XGBoost. We can try to increase number of neurons in the hidden layer (size) and check other decay weights (decay) values.
+
+Here we would like to notice that when training the network we got the following warning message:
+*Warning message:*
+*In nominalTrainWorkflow(x = x, y = y, wts = weights, info = trainInfo,  :*
+*There were missing values in resampled performance measures.*
+It might be due to algorithm not converging in some cases which means that the algorithm did not achieved a state during training in which loss settles to within an error range around the final value. However, as long as the results are reasonable and we are observing most iterations converging to more or less stable results, we have chosen to ignore it. We also increased the number of iterations in the next models.
+
+```{r}
+set.seed(410098)
+
+# We use 5-fold cross-validation to estimate prediction error. 
+ctrl_cv5 <- trainControl(method = "cv", number = 5)
+
+parameters_nn2 <- expand.grid(size = c(5, 10, 15, 20, 25),
+                              decay = c(0, 1e-01, 1e-02, 1e-04, 1e-05))
+
+# houses_nn2  <- train(model_formula,
+#                      data = houses_train_scaled,
+#                      method = "nnet",
+#                      trControl = ctrl_cv5,
+#                      tuneGrid  = parameters_nn2,
+#                      maxit = 1e+03,
+#                      linear.output = T)
+# saveRDS(houses_nn2, "houses_nn2.rds")
+
+houses_nn2 <- readRDS('houses_nn2.rds')
+print(houses_nn2)
+plot(houses_nn2)
+```
+
+We see that we obtained the best results for the model with 20 neurons in the hidden layer (which is close to the recommended 2/3 of the total number of predictors) and decay of 1e-04. However, much higher results for certain combinations of parameters could be due to algorithm not converging.
+
+Let's check how the results compare to other models.
+
+```{r}
+predicted2 = predict(houses_nn2, newdata = houses_train_scaled)
+predicted2_unscaled <- t((t(predicted2) * s_lnpricem2) + c_lnpricem2)
+
+results_train_nn_ff <- regressionMetrics(houses_train$lnpricem2, predicted2_unscaled, "Neural network (fast-forward)")
+results_train_nn_ff
+```
+
+Unfortunately, even by increasing the number of neurons in the hidden layer, we weren't able to achieve results comparable to those of best models in XGBoost, even more random forests.
+
+
+#### Backpropagation neural network
+
+We can also try to add another hidden layer. However, "nnet" does not support that. Therefore, we will use neuralnet package with backpropagation neural net
+work. 
+
+```{r}
+set.seed(410098)
+
+# We use 5-fold cross-validation to estimate prediction error. 
+ctrl_cv5 <- trainControl(method = "cv", number = 5)
+
+# In the default version, we are estimating and comparing models with 1, 3 and 5 neurons in the first hidden layer.
+# houses_nn3  <- train(model_formula,
+#                      data = houses_train_scaled,
+#                      method = "neuralnet",
+#                      trControl = ctrl_cv5,
+#                      linear.output = T)
+# saveRDS(houses_nn3, "houses_nn3.rds")
+
+houses_nn3 <- readRDS('houses_nn3.rds')
+print(houses_nn3)
+```
+
+The RMSE value for 5 neurons in hidden layer isn't higher than those obtained with fast-forward neural networks. Let's try to improve the models by adding more neurons in the hidden layer.
+
+The training of this model took several hours. Therefore, we will try to train the model on a smaller sample of 5000 observations from the training data.
+
+```{r}
+set.seed(410098)
+
+houses_train_scaled_nn <- houses_train_scaled[sample(nrow(houses_train_scaled), size = 5000, replace = FALSE), ]
+
+# We use 5-fold cross-validation to estimate prediction error. 
+ctrl_cv5 <- trainControl(method = "cv", number = 5)
+
+parameters_nn4 <- expand.grid(layer1 = c(5, 10, 15, 20, 25),
+                              layer2 = 0,
+                              layer3 = 0)
+
+# houses_nn4  <- train(model_formula,
+#                      data = houses_train_scaled_nn,
+#                      method = "neuralnet",
+#                      trControl = ctrl_cv5,
+#                      tuneGrid = parameters_nn4,
+#                      linear.output = T)
+# saveRDS(houses_nn4, "houses_nn4.rds")
+# Warnings indicate that we had problems with algorithm converging
+
+houses_nn4 <- readRDS('houses_nn4.rds')
+plot(houses_nn4)
+```
+
+Unfortunately, even after reducing the number of observations only the algorithm for 5 layers converged. Moreover, its performance was lower compared to fast-forward neural networks. At this point we found further training of more complex neural networks rather pointless and abandoned the idea of adding another layer.
+
+
+## Comparison & conclusions
+
+So far, we only tested our models on the training data. Let's recap the best models generated by each method. Please note that we selected the models best performing in terms of cross-validation (or out-of-bag error) results and not best performing on the whole training sample. 
+
+```{r}
+results_train <- rbind(results_train_ols, results_train_rf4, results_train_xgb3, results_train_nn_ff)
+results_train
+```
+
+For training data, all the more sophisticated models improved results compared to OLS. The most striking are the very low errors for Random Forests. Then, XGBoost perfomed better than Neural Networks. 
+
+Let's find out how the result present on testing data which the models did not see and was not taken into account when tuning the parameters.
+
+
+```{r}
+results_test_ols <- regressionMetrics(real = houses_test$lnpricem2,
+                                       predicted = predict(houses_ols, newdata = houses_test),
+                                       name = "OLS")
+
+results_test_rf4 <- regressionMetrics(real = houses_test$lnpricem2,
+                                       predicted = predict(houses_rf4, newdata = houses_test),
+                                       name = "Random forest (ranger)")
+
+results_test_xgb3 <- regressionMetrics(real = houses_test$lnpricem2,
+                                        predicted = predict(houses_xgb3, newdata = houses_test),
+                                        name = "XGBoost")
+
+predicted2 = predict(houses_nn2, newdata = houses_test_scaled)
+predicted2_unscaled <- t((t(predicted2) * s_lnpricem2) + c_lnpricem2)
+
+results_test_nn_ff <- regressionMetrics(houses_test$lnpricem2, predicted2_unscaled, "Neural network (fast-forward)")
+
+results_test <- rbind(results_test_ols, results_test_rf4, results_test_xgb3, results_test_nn_ff)
+results_test
+```
+
+The order of performance on the testing data remained the same on the training data. 
+
+The OLS was the worst performing model. However, there was almost no overfitting effect as the results on training and testing data were very close. Second to last were neural networks. Here also overfitting effect wasn't very high.
+
+Next, as the second best model came XGBoost. It could be predicted than XGBoost would outperform Neural Networks as this method usally performs better in regression problems, such as this one. However, we can see that errors obtained on testing data were visibly higher than on the training data. It seeems that cross-validation didn't eliminate overfitting effect as much as we would like to and next time we should probably use separate validation dataset.
+
+The best performing model is still Random Forest. It is surprising, as usually it is XGBoost than performs better than random forests due to its, not the other way around. One possible explanation for that which we could think of is that we could better tune the parameters for XGBoost. Apart from that, a big overfitting effect for Random Forests is alarming. Here again we could have chosen a different method for validating model performance and probably take that into account when choosing the parameters.
+
